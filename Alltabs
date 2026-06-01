@@ -1,0 +1,234 @@
+// ============================================================
+// CLICKUP → SPREADSHEET SYNC — All other client tabs
+// Syncs ONLY main task status from ClickUp to Google Sheet
+// To add a new client tab, just add its name to TABS_TO_SYNC
+// ============================================================
+
+const OTHER_TABS_CU_LINK     = 4;  // Column D — ClickUp main task hyperlink
+const OTHER_TABS_STATUS_COL  = 8;  // Column H — main task status dropdown
+const OTHER_TABS_FIRST_ROW   = 6;  // Row where data starts
+
+// ✅ ADD NEW CLIENT TABS HERE — just add the tab name to this list
+const TABS_TO_SYNC = [
+  'LPT',
+  'SMC',
+  'MOT',
+  'OPH',
+  'ADC',
+  'SCR',
+  'VY',
+  'MH'
+];
+
+
+// ------------------------------------------------------------
+// MENU — adds to existing VIP Sync menu
+// ------------------------------------------------------------
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('VIP Sync')
+    .addItem('🔄 Sync ClickUp (Dates + Status) — VIP2', 'syncClickUp')
+    .addItem('🔄 Sync Status — All Other Tabs', 'syncAllOtherTabs')
+    .addItem('🔄 Sync Status — Active Tab Only', 'syncActiveTab')
+    .addItem('🔑 Set API Token', 'setApiToken')
+    .addToUi();
+}
+
+
+// ------------------------------------------------------------
+// SET API TOKEN (stored securely, never in the sheet)
+// ------------------------------------------------------------
+function setApiToken() {
+  const ui = SpreadsheetApp.getUi();
+  const result = ui.prompt(
+    'ClickUp API Token',
+    'Paste your ClickUp API token (it will be stored securely):',
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (result.getSelectedButton() === ui.Button.OK) {
+    const token = result.getResponseText().trim();
+    if (token) {
+      PropertiesService.getUserProperties().setProperty('CU_API_TOKEN', token);
+      ui.alert('✅ Token saved successfully!');
+    }
+  }
+}
+
+
+// ------------------------------------------------------------
+// GET API TOKEN
+// ------------------------------------------------------------
+function getApiToken() {
+  const token = PropertiesService.getUserProperties().getProperty('CU_API_TOKEN');
+  if (!token) {
+    SpreadsheetApp.getUi().alert(
+      '⚠️ No API token found.\n\nGo to VIP Sync → Set API Token first.'
+    );
+    return null;
+  }
+  return token;
+}
+
+
+// ------------------------------------------------------------
+// EXTRACT TASK ID FROM CLICKUP URL
+// ------------------------------------------------------------
+function extractTaskIdOther(url) {
+  if (!url) return null;
+  const match = url.match(/clickup\.com\/t\/([a-zA-Z0-9]+)/);
+  return match ? match[1] : null;
+}
+
+
+// ------------------------------------------------------------
+// FETCH MAIN TASK STATUS FROM CLICKUP API
+// Retries once on connection error before skipping
+// ------------------------------------------------------------
+function getMainTaskStatus(taskId, token) {
+  const url = `https://api.clickup.com/api/v2/task/${taskId}`;
+  const options = {
+    method: 'GET',
+    headers: {
+      'Authorization': token,
+      'Content-Type': 'application/json'
+    },
+    muteHttpExceptions: true
+  };
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const response = UrlFetchApp.fetch(url, options);
+      const code = response.getResponseCode();
+      if (code === 200) {
+        const data = JSON.parse(response.getContentText());
+        return data.status?.status?.toUpperCase() || null;
+      }
+      Logger.log(`Attempt ${attempt} — Error fetching task ${taskId}: HTTP ${code}`);
+    } catch (e) {
+      Logger.log(`Attempt ${attempt} — Connection error for task ${taskId}: ${e.message}`);
+    }
+    if (attempt === 1) Utilities.sleep(1000);
+  }
+
+  Logger.log(`Skipping task ${taskId} after 2 failed attempts`);
+  return null;
+}
+
+
+// ------------------------------------------------------------
+// SYNC A SINGLE TAB
+// ------------------------------------------------------------
+function syncTab(sheet, token) {
+  const lastRow = sheet.getLastRow();
+  let updatedRows = 0;
+  const skippedRows = [];
+
+  for (let row = OTHER_TABS_FIRST_ROW; row <= lastRow; row++) {
+
+    // Get CU hyperlink from column D
+    const cell = sheet.getRange(row, OTHER_TABS_CU_LINK);
+    const richText = cell.getRichTextValue();
+    let cuUrl = null;
+
+    if (richText) {
+      const runs = richText.getRuns();
+      for (const run of runs) {
+        const link = run.getLinkUrl();
+        if (link && link.includes('clickup.com')) {
+          cuUrl = link;
+          break;
+        }
+      }
+    }
+
+    // Fallback: plain cell value
+    if (!cuUrl) {
+      const val = cell.getValue();
+      if (val && String(val).includes('clickup.com')) cuUrl = String(val);
+    }
+
+    if (!cuUrl) continue;
+
+    const taskId = extractTaskIdOther(cuUrl);
+    if (!taskId) continue;
+
+    // Fetch and write main task status
+    const status = getMainTaskStatus(taskId, token);
+    if (status) {
+      sheet.getRange(row, OTHER_TABS_STATUS_COL).setValue(status);
+      updatedRows++;
+      Logger.log(`${sheet.getName()} Row ${row}: Status → ${status}`);
+    } else {
+      skippedRows.push(row);
+    }
+
+    Utilities.sleep(200);
+  }
+
+  return { updatedRows, skippedRows };
+}
+
+
+// ------------------------------------------------------------
+// SYNC ALL OTHER TABS
+// ------------------------------------------------------------
+function syncAllOtherTabs() {
+  const token = getApiToken();
+  if (!token) return;
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const ui = SpreadsheetApp.getUi();
+  let totalUpdated = 0;
+  const allSkipped = [];
+
+  for (const tabName of TABS_TO_SYNC) {
+    const sheet = ss.getSheetByName(tabName);
+    if (!sheet) {
+      Logger.log(`Tab "${tabName}" not found — skipping`);
+      continue;
+    }
+    Logger.log(`Syncing tab: ${tabName}`);
+    const result = syncTab(sheet, token);
+    totalUpdated += result.updatedRows;
+    if (result.skippedRows.length > 0) {
+      allSkipped.push(`${tabName}: rows ${result.skippedRows.join(', ')}`);
+    }
+  }
+
+  let message = `✅ Sync complete!\n\nTotal rows updated: ${totalUpdated}\n`;
+  if (allSkipped.length > 0) {
+    message += `\n⚠️ Skipped rows:\n${allSkipped.join('\n')}\nRun sync again to retry.`;
+  }
+  ui.alert(message);
+}
+
+
+// ------------------------------------------------------------
+// SYNC ACTIVE TAB ONLY (useful for syncing one tab at a time)
+// ------------------------------------------------------------
+function syncActiveTab() {
+  const token = getApiToken();
+  if (!token) return;
+
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  const tabName = sheet.getName();
+  const ui = SpreadsheetApp.getUi();
+
+  if (tabName === 'VIP') {
+    ui.alert('⚠️ For VIP use "Sync ClickUp (Dates + Status) — VIP" instead.');
+    return;
+  }
+
+  if (!TABS_TO_SYNC.includes(tabName)) {
+    ui.alert(`⚠️ Tab "${tabName}" is not in the sync list.\n\nTo add it, update TABS_TO_SYNC in the script.`);
+    return;
+  }
+
+  const result = syncTab(sheet, token);
+
+  let message = `✅ Sync complete for ${tabName}!\n\nRows updated: ${result.updatedRows}\n`;
+  if (result.skippedRows.length > 0) {
+    message += `\n⚠️ Skipped rows: ${result.skippedRows.join(', ')}\nRun sync again to retry.`;
+  }
+  ui.alert(message);
+}
