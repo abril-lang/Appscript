@@ -1,0 +1,269 @@
+// ============================================================
+// CLICKUP → SPREADSHEET SYNC — VIP2
+// Syncs subtask due dates + status from ClickUp to Google Sheet
+// Also syncs main task status to column H
+// ============================================================
+
+const COLUMN_CU_LINK     = 4;   // Column D — ClickUp main task hyperlink
+const COLUMN_MAIN_STATUS = 8;   // Column H — main task status
+const FIRST_DATA_ROW     = 163; // Start from row 163 (active projects)
+const VERSION_COL_START  = 9;   // Column I — first Version column (1-indexed)
+const COLS_PER_VERSION   = 3;   // I=Version, J=Due Date, K=Status | L=Version, M=Due Date, N=Status...
+const DUE_DATE_OFFSET    = 1;   // Due Date is 1 col after Version
+const STATUS_OFFSET      = 2;   // Status is 2 cols after Version
+
+
+// ------------------------------------------------------------
+// MENU
+// ------------------------------------------------------------
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('VIP Sync')
+    .addItem('🔄 Sync ClickUp (Dates + Status)', 'syncClickUp')
+    .addItem('🔑 Set API Token', 'setApiToken')
+    .addToUi();
+}
+
+
+// ------------------------------------------------------------
+// SET API TOKEN (stored securely, never in the sheet)
+// ------------------------------------------------------------
+function setApiToken() {
+  const ui = SpreadsheetApp.getUi();
+  const result = ui.prompt(
+    'ClickUp API Token',
+    'Paste your ClickUp API token (it will be stored securely):',
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (result.getSelectedButton() === ui.Button.OK) {
+    const token = result.getResponseText().trim();
+    if (token) {
+      PropertiesService.getUserProperties().setProperty('CU_API_TOKEN', token);
+      ui.alert('✅ Token saved successfully!');
+    }
+  }
+}
+
+
+// ------------------------------------------------------------
+// GET API TOKEN
+// ------------------------------------------------------------
+function getApiToken() {
+  const token = PropertiesService.getUserProperties().getProperty('CU_API_TOKEN');
+  if (!token) {
+    SpreadsheetApp.getUi().alert(
+      '⚠️ No API token found.\n\nGo to VIP Sync → Set API Token first.'
+    );
+    return null;
+  }
+  return token;
+}
+
+
+// ------------------------------------------------------------
+// EXTRACT TASK ID FROM CLICKUP URL
+// e.g. https://app.clickup.com/t/86e15n5yb → 86e15n5yb
+// ------------------------------------------------------------
+function extractTaskId(url) {
+  if (!url) return null;
+  const match = url.match(/clickup\.com\/t\/([a-zA-Z0-9]+)/);
+  return match ? match[1] : null;
+}
+
+
+// ------------------------------------------------------------
+// FORMAT TIMESTAMP → "July 7" style text
+// ClickUp returns due dates in milliseconds
+// ------------------------------------------------------------
+function formatDueDate(timestampMs) {
+  if (!timestampMs) return '';
+  const date = new Date(parseInt(timestampMs));
+  return Utilities.formatDate(date, 'America/New_York', 'MMMM d');
+}
+
+
+// ------------------------------------------------------------
+// FETCH MAIN TASK + SUBTASKS FROM CLICKUP API
+// Retries once on connection error before skipping
+// ------------------------------------------------------------
+function getTaskData(taskId, token) {
+  const url = `https://api.clickup.com/api/v2/task/${taskId}?include_subtasks=true`;
+  const options = {
+    method: 'GET',
+    headers: {
+      'Authorization': token,
+      'Content-Type': 'application/json'
+    },
+    muteHttpExceptions: true
+  };
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const response = UrlFetchApp.fetch(url, options);
+      const code = response.getResponseCode();
+      if (code === 200) return JSON.parse(response.getContentText());
+      Logger.log(`Attempt ${attempt} — Error fetching task ${taskId}: HTTP ${code}`);
+    } catch (e) {
+      Logger.log(`Attempt ${attempt} — Connection error for task ${taskId}: ${e.message}`);
+    }
+    if (attempt === 1) Utilities.sleep(1000);
+  }
+
+  Logger.log(`Skipping task ${taskId} after 2 failed attempts`);
+  return null;
+}
+
+
+// ------------------------------------------------------------
+// PARSE VERSION LABEL FROM SUBTASK NAME
+// e.g. "VIP210_V1 ABC" → "V1"
+//      "VIP179_Masters" → "Masters"
+//      "VIP210_V2 ABC" → "V2"
+//      "VIP210_Shoutout ABC" → "Shoutout"
+// ------------------------------------------------------------
+function parseVersionLabel(name) {
+  if (!name) return null;
+  const vMatch = name.match(/_V(\d+)/i);
+  if (vMatch) return `V${vMatch[1]}`;
+  if (name.match(/Masters/i)) return 'Masters';
+  if (name.match(/Shoutout/i)) return 'Shoutout';
+  return null;
+}
+
+
+// ------------------------------------------------------------
+// NORMALIZE STATUS from CU to match sheet dropdown exactly
+// ------------------------------------------------------------
+function normalizeStatus(statusName) {
+  if (!statusName) return '';
+  return statusName.toUpperCase();
+}
+
+
+// ------------------------------------------------------------
+// MAIN SYNC FUNCTION
+// ------------------------------------------------------------
+function syncClickUp() {
+  const token = getApiToken();
+  if (!token) return;
+
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('VIP');
+  if (!sheet) {
+    SpreadsheetApp.getUi().alert('⚠️ Tab "VIP" not found.');
+    return;
+  }
+
+  const lastRow = sheet.getLastRow();
+  const ui = SpreadsheetApp.getUi();
+
+  let updatedRows = 0;
+  let errorRows = 0;
+  const skippedRows = [];
+
+  for (let row = FIRST_DATA_ROW; row <= lastRow; row++) {
+
+    // --- Get CU hyperlink from column D ---
+    const cell = sheet.getRange(row, COLUMN_CU_LINK);
+    const richText = cell.getRichTextValue();
+    let cuUrl = null;
+
+    if (richText) {
+      const runs = richText.getRuns();
+      for (const run of runs) {
+        const link = run.getLinkUrl();
+        if (link && link.includes('clickup.com')) {
+          cuUrl = link;
+          break;
+        }
+      }
+    }
+
+    // Fallback: plain cell value
+    if (!cuUrl) {
+      const val = cell.getValue();
+      if (val && String(val).includes('clickup.com')) cuUrl = String(val);
+    }
+
+    if (!cuUrl) continue;
+
+    const taskId = extractTaskId(cuUrl);
+    if (!taskId) continue;
+
+    // --- Fetch task data from CU ---
+    const taskData = getTaskData(taskId, token);
+    if (!taskData) {
+      errorRows++;
+      skippedRows.push(row);
+      continue;
+    }
+
+    // --- Sync main task status → Column H ---
+    const mainStatus = normalizeStatus(taskData.status?.status);
+    if (mainStatus) {
+      sheet.getRange(row, COLUMN_MAIN_STATUS).setValue(mainStatus);
+      Logger.log(`Row ${row}: Main status → ${mainStatus}`);
+    }
+
+    // --- Build maps: versionLabel → { due_date, status } ---
+    const subtasks = taskData.subtasks || [];
+    const dueDateMap = {};
+    const statusMap = {};
+
+    for (const subtask of subtasks) {
+      const label = parseVersionLabel(subtask.name);
+      if (!label) continue;
+      if (subtask.due_date) dueDateMap[label] = formatDueDate(subtask.due_date);
+      if (subtask.status?.status) statusMap[label] = normalizeStatus(subtask.status.status);
+    }
+
+    // --- Scan columns I onwards and update Due Date + Status ---
+    let col = VERSION_COL_START;
+    let updated = false;
+
+    while (col <= sheet.getLastColumn()) {
+      const versionText = String(sheet.getRange(row, col).getValue()).trim();
+      if (!versionText) {
+        col += COLS_PER_VERSION;
+        continue;
+      }
+
+      // Extract label from cell (e.g. "V1 ABC" → "V1")
+      const cellLabel = versionText.match(/^(V\d+|Masters|Shoutout)/i)?.[1];
+      if (!cellLabel) {
+        col += COLS_PER_VERSION;
+        continue;
+      }
+
+      const lookupLabel = cellLabel.toUpperCase().startsWith('V')
+        ? cellLabel.toUpperCase()
+        : cellLabel.charAt(0).toUpperCase() + cellLabel.slice(1).toLowerCase();
+
+      // Update Due Date
+      if (dueDateMap[lookupLabel]) {
+        sheet.getRange(row, col + DUE_DATE_OFFSET).setValue(dueDateMap[lookupLabel]);
+        updated = true;
+        Logger.log(`Row ${row}: ${lookupLabel} due date → ${dueDateMap[lookupLabel]}`);
+      }
+
+      // Update Status
+      if (statusMap[lookupLabel]) {
+        sheet.getRange(row, col + STATUS_OFFSET).setValue(statusMap[lookupLabel]);
+        updated = true;
+        Logger.log(`Row ${row}: ${lookupLabel} status → ${statusMap[lookupLabel]}`);
+      }
+
+      col += COLS_PER_VERSION;
+    }
+
+    if (updated) updatedRows++;
+
+    // Respect API rate limits
+    Utilities.sleep(200);
+  }
+
+  let message = `✅ Sync complete!\n\nRows updated: ${updatedRows}\n`;
+  if (skippedRows.length > 0) {
+    message += `\n⚠️ Skipped ${skippedRows.length} row(s) due to connection errors: rows ${skippedRows.join(', ')}\nRun sync again to retry those rows.`;
+  }
+  ui.alert(message);
+}
