@@ -1,12 +1,12 @@
 // ============================================================
-// CLICKUP → SPREADSHEET SYNC — VIP2
+// CLICKUP → SPREADSHEET SYNC — VIP
 // Syncs subtask due dates + status from ClickUp to Google Sheet
 // Also syncs main task status to column H
 // ============================================================
 
 const COLUMN_CU_LINK     = 4;   // Column D — ClickUp main task hyperlink
 const COLUMN_MAIN_STATUS = 8;   // Column H — main task status
-const FIRST_DATA_ROW     = 163; // Start from row 163 (active projects)
+const FIRST_DATA_ROW     = 6; // Start from row 6 (active projects)
 const VERSION_COL_START  = 9;   // Column I — first Version column (1-indexed)
 const COLS_PER_VERSION   = 3;   // I=Version, J=Due Date, K=Status | L=Version, M=Due Date, N=Status...
 const DUE_DATE_OFFSET    = 1;   // Due Date is 1 col after Version
