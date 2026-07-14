@@ -1,0 +1,238 @@
+// ============================================================
+//  CONFIGURACIÓN — Edita solo esta sección
+// ============================================================
+
+const CLICKUP_API_KEY = "pk_48471313_83LBGLH3O5CDH1LTN40F8G47NVCQNKN2";  // ← Tu API Key de ClickUp
+const CLICKUP_LIST_ID = "88301430";
+const CLICKUP_TEAM_ID = "10628585";
+
+// Tabs de la spreadsheet — añade o quita según necesites
+const SHEET_TABS = ["LPT", "JPI", "MOT", "SMC", "ABR", "ADC", "VY", "OPH", "FSL"];
+
+// Columnas (índice base 1)
+const COL_LINK   = 4;  // D — Hipervínculo al ticket de ClickUp
+const COL_STATUS = 8;  // H — Status (dropdown)
+const COL_DATE   = 10; // J — Fecha (se llena cuando status = SENT)
+
+// Etiqueta especial que cambia el status a RE-SIZES
+const TAG_RESIZES = "add exports";
+
+// Zona horaria para la fecha de SENT
+const TIMEZONE = "America/Bogota";
+
+
+// ============================================================
+//  SETUP — Corre esta función UNA SOLA VEZ para activar
+//  el sync automático cada 5 minutos.
+//  No necesitas webhook ni deploy como Web App.
+// ============================================================
+
+function registrarTrigger() {
+  // Borra triggers anteriores para evitar duplicados
+  const triggers = ScriptApp.getProjectTriggers();
+  for (const t of triggers) {
+    if (t.getHandlerFunction() === "syncStatuses") {
+      ScriptApp.deleteTrigger(t);
+    }
+  }
+
+  // Registra nuevo trigger cada 5 minutos
+  ScriptApp.newTrigger("syncStatuses")
+    .timeBased()
+    .everyMinutes(5)
+    .create();
+
+  Logger.log("✅ Trigger registrado — syncStatuses cada 5 minutos.");
+}
+
+
+// ============================================================
+//  MAIN SYNC — corre cada 5 minutos automáticamente
+//  1. Lee todos los task IDs de tus tabs en la spreadsheet
+//  2. Trae los estatus de esos tickets desde CU en lote
+//  3. Actualiza solo los que hayan cambiado
+// ============================================================
+
+function syncStatuses() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  // Step 1: Collect all task IDs from all tabs
+  // Map: { taskId -> { tabName, row, currentStatus } }
+  const taskMap = {};
+
+  for (const tabName of SHEET_TABS) {
+    const sheet = ss.getSheetByName(tabName);
+    if (!sheet) continue;
+
+    const lastRow = sheet.getLastRow();
+    if (lastRow < 2) continue;
+
+    const richValues = sheet.getRange(2, COL_LINK, lastRow - 1, 1).getRichTextValues();
+    const statusValues = sheet.getRange(2, COL_STATUS, lastRow - 1, 1).getValues();
+
+    for (let i = 0; i < richValues.length; i++) {
+      const url = extractUrl(richValues[i][0]);
+      if (!url) continue;
+
+      const taskId = extractTaskId(url);
+      if (!taskId) continue;
+
+      const currentStatus = statusValues[i][0] || "";
+      taskMap[taskId] = { tabName, row: i + 2, currentStatus };
+    }
+  }
+
+  const totalTasks = Object.keys(taskMap).length;
+  if (totalTasks === 0) {
+    Logger.log("No tasks found in any tab.");
+    return;
+  }
+
+  Logger.log("Tasks found in spreadsheet: " + totalTasks);
+
+  // Step 2: Fetch all tasks from CU list in pages of 100
+  // Build map: { taskId -> { status, tags } }
+  const cuStatusMap = fetchAllTaskStatuses();
+
+  if (!cuStatusMap) {
+    Logger.log("ERROR: Could not fetch tasks from ClickUp.");
+    return;
+  }
+
+  Logger.log("Tasks fetched from ClickUp: " + Object.keys(cuStatusMap).length);
+
+  // Step 3: Compare and update
+  let updatedCount = 0;
+
+  for (const [taskId, sheetData] of Object.entries(taskMap)) {
+    const cuData = cuStatusMap[taskId];
+    if (!cuData) continue; // task not found in CU (may have been deleted)
+
+    let newStatus = mapStatus(cuData.status);
+    const hasResizeTag = cuData.tags.some(tag =>
+      tag.name?.toLowerCase() === TAG_RESIZES.toLowerCase()
+    );
+    if (hasResizeTag && newStatus === "WORKING") newStatus = "RE-SIZES";
+    if (!newStatus) continue;
+
+    if (newStatus === sheetData.currentStatus) continue; // no change
+
+    // Update the sheet
+    const sheet = ss.getSheetByName(sheetData.tabName);
+    if (!sheet) continue;
+
+    sheet.getRange(sheetData.row, COL_STATUS).setValue(newStatus);
+    Logger.log("[" + sheetData.tabName + "] Row " + sheetData.row + ": " + sheetData.currentStatus + " → " + newStatus);
+
+    if (newStatus === "SENT") {
+      const now = Utilities.formatDate(new Date(), TIMEZONE, "dd/MM/yyyy");
+      sheet.getRange(sheetData.row, COL_DATE).setValue(now);
+      Logger.log("[" + sheetData.tabName + "] SENT date → " + now);
+    }
+
+    updatedCount++;
+  }
+
+  Logger.log("Sync complete — updated: " + updatedCount + " / " + totalTasks + " tasks checked.");
+}
+
+
+// ============================================================
+//  FETCH ALL TASK STATUSES FROM CU IN PAGES OF 100
+//  Returns map: { taskId -> { status, tags } }
+// ============================================================
+
+function fetchAllTaskStatuses() {
+  const cuMap = {};
+  let page = 0;
+  const maxPages = 500; // high enough to never hit in practice
+
+  while (page < maxPages) {
+    const url = "https://api.clickup.com/api/v2/list/" + CLICKUP_LIST_ID +
+      "/task?page=" + page + "&include_subtasks=false&subtasks=false";
+
+    try {
+      const response = UrlFetchApp.fetch(url, {
+        method: "GET",
+        headers: { Authorization: CLICKUP_API_KEY },
+        muteHttpExceptions: true,
+      });
+
+      if (response.getResponseCode() !== 200) {
+        Logger.log("CU API error on page " + page + ": HTTP " + response.getResponseCode());
+        break;
+      }
+
+      const data  = JSON.parse(response.getContentText());
+      const tasks = data.tasks || [];
+
+      for (const task of tasks) {
+        cuMap[task.id] = {
+          status: task.status?.status || "",
+          tags:   task.tags || [],
+        };
+      }
+
+      // CU returns fewer than 100 tasks on the last page
+      if (tasks.length < 100) break;
+
+      page++;
+      Utilities.sleep(200); // respect rate limits between pages
+
+    } catch (e) {
+      Logger.log("Error fetching page " + page + ": " + e);
+      break;
+    }
+  }
+
+  return cuMap;
+}
+
+
+// ============================================================
+//  HELPERS
+// ============================================================
+
+function extractUrl(richTextCell) {
+  try {
+    const runs = richTextCell.getRuns();
+    for (const run of runs) {
+      const link = run.getLinkUrl();
+      if (link) return link;
+    }
+    const plainText = richTextCell.getText();
+    if (plainText && plainText.startsWith("http")) return plainText;
+  } catch (e) {}
+  return null;
+}
+
+function extractTaskId(url) {
+  try {
+    const cleanUrl = url.split("?")[0];
+    const longMatch = cleanUrl.match(/clickup\.com\/t\/\d+\/([a-zA-Z0-9]+)/);
+    if (longMatch) return longMatch[1];
+    const shortMatch = cleanUrl.match(/clickup\.com\/t\/([a-zA-Z0-9]+)/);
+    if (shortMatch) return shortMatch[1];
+    const segments = cleanUrl.split("/").filter(Boolean);
+    return segments[segments.length - 1];
+  } catch (e) {}
+  return null;
+}
+
+function mapStatus(rawStatus) {
+  if (!rawStatus) return null;
+  const map = {
+    "submitted":       "SUBMITTED",
+    "on hold":         "ON HOLD",
+    "working":         "WORKING",
+    "quality control": "QUALITY CONTROL",
+    "qc approved":     "QC APPROVED",
+    "sent":            "SENT",
+    "completadas":     "COMPLETADAS",
+    "complete":        "COMPLETE",
+    "cancelled":       "CANCELLED",
+    "subtitling":      "SUBTITLING",
+    "re-sizes":        "RE-SIZES",
+  };
+  return map[rawStatus.toLowerCase()] || rawStatus.toUpperCase();
+}
