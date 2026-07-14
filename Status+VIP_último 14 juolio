@@ -1,0 +1,592 @@
+// ============================================================
+// COMBINED SCRIPT — VIP PM Spreadsheet
+// Part 1: Status sync for client tabs (polling every 5 min)
+// Part 2: VIP tab sync (dates + status for subtasks)
+// Part 3: VIP Queue Report generator
+// ============================================================
+
+
+// ============================================================
+// PART 1 — STATUS SYNC (Client tabs via polling every 5 min)
+// ============================================================
+
+// ── CONFIGURATION ───────────────────────────────────────────
+const CLICKUP_API_KEY = "API KEY";  // ← Tu API Key de ClickUp
+const CLICKUP_LIST_ID = "88301430";
+const CLICKUP_TEAM_ID = "10628585";
+
+const SHEET_TABS = ["DCA", "RHF", "MGS", "FB", "WPR", "IFIT"];
+
+const COL_LINK   = 4;  // D — ClickUp task hyperlink
+const COL_STATUS = 8;  // H — Status dropdown
+const COL_DATE   = 10; // J — Delivery date (set when status = SENT)
+
+const TAG_RESIZES = "add exports";
+const TIMEZONE    = "America/Bogota";
+
+
+// ------------------------------------------------------------
+// SETUP — Run once to activate the 5-minute polling trigger
+// ------------------------------------------------------------
+function registrarTrigger() {
+  const triggers = ScriptApp.getProjectTriggers();
+  for (const t of triggers) {
+    if (t.getHandlerFunction() === "syncStatuses") {
+      ScriptApp.deleteTrigger(t);
+    }
+  }
+  ScriptApp.newTrigger("syncStatuses")
+    .timeBased()
+    .everyMinutes(5)
+    .create();
+  Logger.log("✅ Trigger registered — syncStatuses every 5 minutes.");
+}
+
+
+// ------------------------------------------------------------
+// MAIN SYNC — runs every 5 minutes automatically
+// 1. Reads all task IDs from client tabs in the spreadsheet
+// 2. Fetches all task statuses from CU in bulk (pages of 100)
+// 3. Updates only the rows where status has changed
+// ------------------------------------------------------------
+function syncStatuses() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  // Step 1: Collect all task IDs from client tabs
+  const taskMap = {};
+
+  for (const tabName of SHEET_TABS) {
+    const sheet = ss.getSheetByName(tabName);
+    if (!sheet) continue;
+
+    const lastRow = sheet.getLastRow();
+    if (lastRow < 2) continue;
+
+    const richValues   = sheet.getRange(2, COL_LINK, lastRow - 1, 1).getRichTextValues();
+    const statusValues = sheet.getRange(2, COL_STATUS, lastRow - 1, 1).getValues();
+
+    for (let i = 0; i < richValues.length; i++) {
+      const url = extractUrlFromCell(richValues[i][0]);
+      if (!url) continue;
+      const taskId = extractTaskIdFromUrl(url);
+      if (!taskId) continue;
+      taskMap[taskId] = { tabName, row: i + 2, currentStatus: statusValues[i][0] || "" };
+    }
+  }
+
+  const totalTasks = Object.keys(taskMap).length;
+  if (totalTasks === 0) { Logger.log("No tasks found in any tab."); return; }
+  Logger.log("Tasks found in spreadsheet: " + totalTasks);
+
+  // Step 2: Fetch all task statuses from CU in bulk
+  const cuStatusMap = fetchAllTaskStatuses();
+  if (!cuStatusMap) { Logger.log("ERROR: Could not fetch tasks from ClickUp."); return; }
+  Logger.log("Tasks fetched from ClickUp: " + Object.keys(cuStatusMap).length);
+
+  // Step 3: Compare and update
+  let updatedCount = 0;
+
+  for (const [taskId, sheetData] of Object.entries(taskMap)) {
+    const cuData = cuStatusMap[taskId];
+    if (!cuData) continue;
+
+    let newStatus = mapStatus(cuData.status);
+    const hasResizeTag = cuData.tags.some(tag =>
+      tag.name?.toLowerCase() === TAG_RESIZES.toLowerCase()
+    );
+    if (hasResizeTag && newStatus === "WORKING") newStatus = "RE-SIZES";
+    if (!newStatus) continue;
+    if (newStatus === sheetData.currentStatus) continue;
+
+    const sheet = ss.getSheetByName(sheetData.tabName);
+    if (!sheet) continue;
+
+    sheet.getRange(sheetData.row, COL_STATUS).setValue(newStatus);
+    Logger.log("[" + sheetData.tabName + "] Row " + sheetData.row + ": " + sheetData.currentStatus + " → " + newStatus);
+
+    if (newStatus === "SENT") {
+      const now = Utilities.formatDate(new Date(), TIMEZONE, "dd/MM/yyyy");
+      sheet.getRange(sheetData.row, COL_DATE).setValue(now);
+      Logger.log("[" + sheetData.tabName + "] SENT date → " + now);
+    }
+
+    updatedCount++;
+  }
+
+  Logger.log("Sync complete — updated: " + updatedCount + " / " + totalTasks + " tasks checked.");
+}
+
+
+// ------------------------------------------------------------
+// FETCH ALL TASK STATUSES FROM CU IN PAGES OF 100
+// Returns map: { taskId -> { status, tags } }
+// ------------------------------------------------------------
+function fetchAllTaskStatuses() {
+  const cuMap = {};
+  let page = 0;
+  const maxPages = 500; // high enough to never hit in practice
+
+  while (page < maxPages) {
+    const url = "https://api.clickup.com/api/v2/list/" + CLICKUP_LIST_ID +
+      "/task?page=" + page + "&include_subtasks=false&subtasks=false";
+
+    try {
+      const response = UrlFetchApp.fetch(url, {
+        method: "GET",
+        headers: { Authorization: CLICKUP_API_KEY },
+        muteHttpExceptions: true,
+      });
+
+      if (response.getResponseCode() !== 200) {
+        Logger.log("CU API error on page " + page + ": HTTP " + response.getResponseCode());
+        break;
+      }
+
+      const data  = JSON.parse(response.getContentText());
+      const tasks = data.tasks || [];
+
+      for (const task of tasks) {
+        cuMap[task.id] = { status: task.status?.status || "", tags: task.tags || [] };
+      }
+
+      if (tasks.length < 100) break;
+      page++;
+      Utilities.sleep(200);
+
+    } catch (e) {
+      Logger.log("Error fetching page " + page + ": " + e);
+      break;
+    }
+  }
+
+  return cuMap;
+}
+
+
+// ------------------------------------------------------------
+// HELPERS — Part 1
+// ------------------------------------------------------------
+function extractUrlFromCell(richTextCell) {
+  try {
+    const runs = richTextCell.getRuns();
+    for (const run of runs) {
+      const link = run.getLinkUrl();
+      if (link) return link;
+    }
+    const plainText = richTextCell.getText();
+    if (plainText && plainText.startsWith("http")) return plainText;
+  } catch (e) {}
+  return null;
+}
+
+function extractTaskIdFromUrl(url) {
+  try {
+    const cleanUrl = url.split("?")[0];
+    const longMatch = cleanUrl.match(/clickup\.com\/t\/\d+\/([a-zA-Z0-9]+)/);
+    if (longMatch) return longMatch[1];
+    const shortMatch = cleanUrl.match(/clickup\.com\/t\/([a-zA-Z0-9]+)/);
+    if (shortMatch) return shortMatch[1];
+    const segments = cleanUrl.split("/").filter(Boolean);
+    return segments[segments.length - 1];
+  } catch (e) {}
+  return null;
+}
+
+function mapStatus(rawStatus) {
+  if (!rawStatus) return null;
+  const map = {
+    "submitted":       "SUBMITTED",
+    "on hold":         "ON HOLD",
+    "working":         "WORKING",
+    "quality control": "QUALITY CONTROL",
+    "qc approved":     "QC APPROVED",
+    "sent":            "SENT",
+    "completadas":     "COMPLETADAS",
+    "complete":        "COMPLETE",
+    "cancelled":       "CANCELLED",
+    "subtitling":      "SUBTITLING",
+    "re-sizes":        "RE-SIZES",
+  };
+  return map[rawStatus.toLowerCase()] || rawStatus.toUpperCase();
+}
+
+
+// ============================================================
+// PART 2 — VIP TAB SYNC (dates + status for subtasks)
+// ============================================================
+
+const COLUMN_CU_LINK     = 4;
+const COLUMN_MAIN_STATUS = 8;
+const FIRST_DATA_ROW     = 6;
+const VERSION_COL_START  = 9;
+const COLS_PER_VERSION   = 3;
+const DUE_DATE_OFFSET    = 1;
+const STATUS_OFFSET      = 2;
+
+// ------------------------------------------------------------
+// MENU
+// ------------------------------------------------------------
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('VIP Sync')
+    .addItem('🔄 Sync ClickUp (Dates + Status)', 'syncClickUp')
+    .addItem('📋 Generate VIP Report', 'generateVIPReport')
+    .addItem('🔑 Set API Token', 'setApiToken')
+    .addToUi();
+}
+
+// ------------------------------------------------------------
+// SET / GET API TOKEN
+// ------------------------------------------------------------
+function setApiToken() {
+  const ui = SpreadsheetApp.getUi();
+  const result = ui.prompt(
+    'ClickUp API Token',
+    'Paste your ClickUp API token (it will be stored securely):',
+    ui.ButtonSet.OK_CANCEL
+  );
+  if (result.getSelectedButton() === ui.Button.OK) {
+    const token = result.getResponseText().trim();
+    if (token) {
+      PropertiesService.getUserProperties().setProperty('CU_API_TOKEN', token);
+      ui.alert('✅ Token saved successfully!');
+    }
+  }
+}
+
+function getApiToken() {
+  const token = PropertiesService.getUserProperties().getProperty('CU_API_TOKEN');
+  if (!token) {
+    try {
+      SpreadsheetApp.getUi().alert('⚠️ No API token found.\n\nGo to VIP Sync → Set API Token first.');
+    } catch (e) {
+      Logger.log('No API token found.');
+    }
+    return null;
+  }
+  return token;
+}
+
+// ------------------------------------------------------------
+// EXTRACT TASK ID FROM CLICKUP URL
+// ------------------------------------------------------------
+function extractTaskId(url) {
+  if (!url) return null;
+  const match = url.match(/clickup\.com\/t\/([a-zA-Z0-9]+)/);
+  return match ? match[1] : null;
+}
+
+// ------------------------------------------------------------
+// FORMAT TIMESTAMP → "July 7" style
+// ------------------------------------------------------------
+function formatDueDate(timestampMs) {
+  if (!timestampMs) return '';
+  const date = new Date(parseInt(timestampMs));
+  return Utilities.formatDate(date, 'UTC', 'MMMM d');
+}
+
+// ------------------------------------------------------------
+// FETCH MAIN TASK + SUBTASKS FROM CLICKUP API
+// ------------------------------------------------------------
+function getTaskData(taskId, token) {
+  const url = `https://api.clickup.com/api/v2/task/${taskId}?include_subtasks=true&subtasks=true`;
+  const options = {
+    method: 'GET',
+    headers: { 'Authorization': token, 'Content-Type': 'application/json' },
+    muteHttpExceptions: true
+  };
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const response = UrlFetchApp.fetch(url, options);
+      const code = response.getResponseCode();
+      if (code === 200) return JSON.parse(response.getContentText());
+      Logger.log(`Attempt ${attempt} — Error fetching task ${taskId}: HTTP ${code}`);
+    } catch (e) {
+      Logger.log(`Attempt ${attempt} — Connection error for task ${taskId}: ${e.message}`);
+    }
+    if (attempt === 1) Utilities.sleep(1000);
+  }
+  return null;
+}
+
+// ------------------------------------------------------------
+// PARSE VERSION LABEL FROM SUBTASK NAME
+// ------------------------------------------------------------
+function parseVersionLabel(name) {
+  if (!name) return null;
+  const vMatch = name.match(/_V(\d+)/i);
+  if (vMatch) return `V${vMatch[1]}`;
+  const extras = ['Masters', 'Shoutout', 'Lyric', 'Lyrics', 'Square', 'Vertical', 'Horizontal'];
+  for (const extra of extras) {
+    if (name.match(new RegExp(extra, 'i'))) return extra.charAt(0).toUpperCase() + extra.slice(1).toLowerCase();
+  }
+  return null;
+}
+
+// ------------------------------------------------------------
+// NORMALIZE LABEL for lookup
+// ------------------------------------------------------------
+function normalizeCellLabel(cellText) {
+  if (!cellText) return null;
+  const text = String(cellText).trim();
+  const vMatch = text.match(/^V(\d+)/i);
+  if (vMatch) return `V${vMatch[1]}`;
+  const extras = ['Masters', 'Shoutout', 'Lyric', 'Lyrics', 'Square', 'Vertical', 'Horizontal'];
+  for (const extra of extras) {
+    if (text.match(new RegExp(`^${extra}`, 'i'))) {
+      return extra.charAt(0).toUpperCase() + extra.slice(1).toLowerCase();
+    }
+  }
+  return null;
+}
+
+// ------------------------------------------------------------
+// NORMALIZE STATUS
+// ------------------------------------------------------------
+function normalizeStatus(statusName) {
+  if (!statusName) return '';
+  return statusName.toUpperCase();
+}
+
+// ------------------------------------------------------------
+// MAIN VIP SYNC FUNCTION
+// ------------------------------------------------------------
+function syncClickUp() {
+  const token = getApiToken();
+  if (!token) return;
+
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('VIP');
+  if (!sheet) { SpreadsheetApp.getUi().alert('⚠️ Tab "VIP" not found.'); return; }
+
+  const lastRow = sheet.getLastRow();
+  const ui = SpreadsheetApp.getUi();
+  let updatedRows = 0;
+  let errorRows = 0;
+  const skippedRows = [];
+
+  for (let row = FIRST_DATA_ROW; row <= lastRow; row++) {
+    const cell = sheet.getRange(row, COLUMN_CU_LINK);
+    const richText = cell.getRichTextValue();
+    let cuUrl = null;
+
+    if (richText) {
+      const runs = richText.getRuns();
+      for (const run of runs) {
+        const link = run.getLinkUrl();
+        if (link && link.includes('clickup.com')) { cuUrl = link; break; }
+      }
+    }
+    if (!cuUrl) {
+      const val = cell.getValue();
+      if (val && String(val).includes('clickup.com')) cuUrl = String(val);
+    }
+    if (!cuUrl) continue;
+
+    const taskId = extractTaskId(cuUrl);
+    if (!taskId) continue;
+
+    const taskData = getTaskData(taskId, token);
+    if (!taskData) { errorRows++; skippedRows.push(row); continue; }
+
+    const mainStatus = normalizeStatus(taskData.status?.status);
+    if (mainStatus) sheet.getRange(row, COLUMN_MAIN_STATUS).setValue(mainStatus);
+
+    const subtasks = taskData.subtasks || [];
+    const dueDateMap = {};
+    const statusMap  = {};
+
+    for (const subtask of subtasks) {
+      const label = parseVersionLabel(subtask.name);
+      if (!label) continue;
+      if (subtask.due_date) dueDateMap[label] = formatDueDate(subtask.due_date);
+      if (subtask.status?.status) statusMap[label] = normalizeStatus(subtask.status.status);
+    }
+
+    const lastCol = sheet.getLastColumn();
+    let col = VERSION_COL_START;
+    const coveredLabels = new Set();
+    let updated = false;
+
+    while (col <= lastCol) {
+      const cellVal     = sheet.getRange(row, col).getValue();
+      const versionText = String(cellVal).trim();
+      if (!versionText) { col += COLS_PER_VERSION; continue; }
+
+      const cellLabel = normalizeCellLabel(versionText);
+      if (!cellLabel) { col += COLS_PER_VERSION; continue; }
+
+      coveredLabels.add(cellLabel);
+
+      if (dueDateMap[cellLabel] !== undefined) {
+        sheet.getRange(row, col + DUE_DATE_OFFSET).setValue(dueDateMap[cellLabel]);
+        updated = true;
+      }
+      if (statusMap[cellLabel] !== undefined) {
+        sheet.getRange(row, col + STATUS_OFFSET).setValue(statusMap[cellLabel]);
+        updated = true;
+      }
+      col += COLS_PER_VERSION;
+    }
+
+    const allCuLabels    = Object.keys(dueDateMap).concat(Object.keys(statusMap).filter(k => !dueDateMap[k]));
+    const uniqueCuLabels = [...new Set(allCuLabels)];
+
+    for (const label of uniqueCuLabels) {
+      if (coveredLabels.has(label)) continue;
+      let writeCol = VERSION_COL_START;
+      while (writeCol <= lastCol) {
+        const existing = String(sheet.getRange(row, writeCol).getValue()).trim();
+        if (!existing) break;
+        writeCol += COLS_PER_VERSION;
+      }
+      sheet.getRange(row, writeCol).setValue(label);
+      if (dueDateMap[label]) sheet.getRange(row, writeCol + DUE_DATE_OFFSET).setValue(dueDateMap[label]);
+      if (statusMap[label])  sheet.getRange(row, writeCol + STATUS_OFFSET).setValue(statusMap[label]);
+      updated = true;
+    }
+
+    if (updated) updatedRows++;
+    Utilities.sleep(200);
+  }
+
+  let message = `✅ Sync complete!\n\nRows updated: ${updatedRows}\n`;
+  if (skippedRows.length > 0) {
+    message += `\n⚠️ Skipped ${skippedRows.length} row(s) due to connection errors: rows ${skippedRows.join(', ')}\nRun sync again to retry.`;
+  }
+  ui.alert(message);
+}
+
+
+// ============================================================
+// PART 3 — VIP QUEUE REPORT GENERATOR
+// ============================================================
+
+const REPORT_SHEET_NAME = 'VIP Report';
+const ACTIVE_STATUSES   = ['SUBMITTED', 'WORKING', 'QC APPROVED', 'QC'];
+const REPORT_FIRST_ROW  = 163;
+
+const INTRO_MESSAGE =
+  "Here's what the queue looks like at the moment, based on show dates and taking into account " +
+  "our observed holidays. You can check our observed holidays here:\nhttps://www.editcrew.com/observed-holidays";
+
+function cleanProjectName(rawName) {
+  if (!rawName) return '';
+  return String(rawName).replace(/^VIP\d+_/i, '').trim();
+}
+
+function isActiveRow(sheet, row) {
+  let col = VERSION_COL_START;
+  const lastCol = sheet.getLastColumn();
+  while (col <= lastCol) {
+    const versionLabel = String(sheet.getRange(row, col).getValue()).trim();
+    if (!versionLabel) { col += COLS_PER_VERSION; continue; }
+    const vStatus = String(sheet.getRange(row, col + STATUS_OFFSET).getValue()).trim().toUpperCase();
+    if (ACTIVE_STATUSES.includes(vStatus)) return true;
+    col += COLS_PER_VERSION;
+  }
+  return false;
+}
+
+function buildVersionLines(sheet, row) {
+  const dateGroups = {};
+  const dateOrder  = [];
+  let col = VERSION_COL_START;
+  const lastCol = sheet.getLastColumn();
+
+  while (col <= lastCol) {
+    const versionCell = String(sheet.getRange(row, col).getValue()).trim();
+    if (!versionCell) { col += COLS_PER_VERSION; continue; }
+
+    const vStatus = String(sheet.getRange(row, col + STATUS_OFFSET).getValue()).trim().toUpperCase();
+    if (!ACTIVE_STATUSES.includes(vStatus)) { col += COLS_PER_VERSION; continue; }
+
+    const label = normalizeCellLabel(versionCell) || versionCell;
+    const dueDateRaw = sheet.getRange(row, col + DUE_DATE_OFFSET).getValue();
+    let dueDateStr = '';
+    if (dueDateRaw instanceof Date) {
+      dueDateStr = Utilities.formatDate(dueDateRaw, 'UTC', 'MMMM d');
+    } else if (dueDateRaw) {
+      dueDateStr = String(dueDateRaw).trim();
+    }
+    if (!dueDateStr) { col += COLS_PER_VERSION; continue; }
+
+    if (!dateGroups[dueDateStr]) { dateGroups[dueDateStr] = []; dateOrder.push(dueDateStr); }
+    dateGroups[dueDateStr].push(label);
+    col += COLS_PER_VERSION;
+  }
+
+  const lines = [];
+  for (const date of dateOrder) {
+    lines.push(`  • ${mergeConsecutiveLabels(dateGroups[date])} due: ${date}`);
+  }
+  return lines;
+}
+
+function mergeConsecutiveLabels(labels) {
+  if (!labels || labels.length === 0) return '';
+  if (labels.length === 1) return labels[0];
+  const allVersioned = labels.every(l => /^V\d+$/i.test(l));
+  if (!allVersioned) return labels.join(', ');
+  const nums = labels.map(l => parseInt(l.replace(/V/i, '')));
+  let isConsecutive = true;
+  for (let i = 1; i < nums.length; i++) {
+    if (nums[i] !== nums[i - 1] + 1) { isConsecutive = false; break; }
+  }
+  return isConsecutive ? `V${nums[0]}-V${nums[nums.length - 1]}` : labels.join(', ');
+}
+
+function generateVIPReport() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const vipSheet = ss.getSheetByName('VIP');
+  if (!vipSheet) { SpreadsheetApp.getUi().alert('⚠️ Tab "VIP" not found.'); return; }
+
+  const lastRow  = vipSheet.getLastRow();
+  const projects = [];
+
+  for (let row = REPORT_FIRST_ROW; row <= lastRow; row++) {
+    const cellVal  = vipSheet.getRange(row, COLUMN_CU_LINK).getValue();
+    const richText = vipSheet.getRange(row, COLUMN_CU_LINK).getRichTextValue();
+    let hasCuLink  = false;
+    if (richText) {
+      for (const run of richText.getRuns()) {
+        if (run.getLinkUrl() && run.getLinkUrl().includes('clickup.com')) { hasCuLink = true; break; }
+      }
+    }
+    if (!hasCuLink && (!cellVal || !String(cellVal).includes('clickup.com'))) continue;
+    if (!isActiveRow(vipSheet, row)) continue;
+
+    const richTextD = vipSheet.getRange(row, COLUMN_CU_LINK).getRichTextValue();
+    let rawName = richTextD ? richTextD.getText() : String(cellVal);
+    const cleanName = cleanProjectName(rawName);
+    const versionLines = buildVersionLines(vipSheet, row);
+    if (versionLines.length === 0) continue;
+    projects.push({ name: cleanName, lines: versionLines });
+  }
+
+  if (projects.length === 0) {
+    SpreadsheetApp.getUi().alert('⚠️ No active projects found.');
+    return;
+  }
+
+  let reportSheet = ss.getSheetByName(REPORT_SHEET_NAME);
+  if (!reportSheet) {
+    reportSheet = ss.insertSheet(REPORT_SHEET_NAME);
+  } else {
+    reportSheet.clearContents();
+  }
+
+  let fullReport = INTRO_MESSAGE + '\n\n';
+  for (const project of projects) {
+    fullReport += project.name + '\n';
+    for (const line of project.lines) fullReport += line + '\n';
+    fullReport += '\n';
+  }
+
+  reportSheet.getRange(1, 1).setValue(fullReport.trim());
+  reportSheet.getRange(1, 1).setWrap(true);
+  reportSheet.setColumnWidth(1, 600);
+  reportSheet.setRowHeight(1, 40 * (fullReport.split('\n').length));
+  ss.setActiveSheet(reportSheet);
+  SpreadsheetApp.getUi().alert(`✅ Report generated!\n\n${projects.length} active projects included.\n\nCheck the "VIP Report" tab.`);
+}
