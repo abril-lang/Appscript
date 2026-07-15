@@ -1,20 +1,21 @@
 // ============================================================
 // COMBINED SCRIPT — VIP PM Spreadsheet
-// Part 1: Status sync for client tabs (polling every 5 min)
+// Part 1: Status sync for client tabs (webhook + polling every 5 min)
 // Part 2: VIP tab sync (dates + status for subtasks)
 // Part 3: VIP Queue Report generator
 // ============================================================
 
 
 // ============================================================
-// PART 1 — STATUS SYNC (Client tabs via polling every 5 min)
+// PART 1 — STATUS SYNC (Client tabs)
 // ============================================================
 
 // ── CONFIGURATION ───────────────────────────────────────────
-const CLICKUP_API_KEY = "API KEY";  // ← Tu API Key de ClickUp
+const CLICKUP_API_KEY = "pk_48471313_83LBGLH3O5CDH1LTN40F8G47NVCQNKN2";  // ← Tu API Key de ClickUp
 const CLICKUP_LIST_ID = "88301430";
 const CLICKUP_TEAM_ID = "10628585";
 
+// Client tabs — VIP tab is NOT included here (handled separately in Part 2)
 const SHEET_TABS = ["DCA", "RHF", "MGS", "FB", "WPR", "IFIT"];
 
 const COL_LINK   = 4;  // D — ClickUp task hyperlink
@@ -26,7 +27,161 @@ const TIMEZONE    = "America/Bogota";
 
 
 // ------------------------------------------------------------
-// SETUP — Run once to activate the 5-minute polling trigger
+// WEBHOOK — receives ClickUp events in real time
+// ------------------------------------------------------------
+function doPost(e) {
+  try {
+    const payload   = JSON.parse(e.postData.contents);
+    const eventType = payload.event;
+    const taskId    = payload.task_id;
+
+    Logger.log("Webhook recibido — event: " + eventType + " | taskId: " + taskId);
+
+    if (!taskId) return jsonResponse({ ok: false, reason: "no task_id" });
+    if (!["taskStatusUpdated", "taskTagUpdated"].includes(eventType)) {
+      return jsonResponse({ ok: true, reason: "evento ignorado" });
+    }
+
+    PropertiesService.getScriptProperties().setProperty("PENDING_TASK_" + taskId, eventType);
+    ScriptApp.newTrigger("processPendingTask")
+      .timeBased()
+      .after(1000)
+      .create();
+
+    return jsonResponse({ ok: true, received: true });
+
+  } catch (err) {
+    Logger.log("Error en doPost: " + err);
+    return jsonResponse({ ok: false, error: err.toString() });
+  }
+}
+
+function processPendingTask() {
+  const triggers = ScriptApp.getProjectTriggers();
+  for (const t of triggers) {
+    if (t.getHandlerFunction() === "processPendingTask") {
+      ScriptApp.deleteTrigger(t);
+    }
+  }
+
+  const props = PropertiesService.getScriptProperties().getProperties();
+  for (const key of Object.keys(props)) {
+    if (!key.startsWith("PENDING_TASK_")) continue;
+    const taskId = key.replace("PENDING_TASK_", "");
+    PropertiesService.getScriptProperties().deleteProperty(key);
+
+    const taskData = getClickUpTaskSingle(taskId);
+    if (!taskData) continue;
+
+    let newStatus = mapStatus(taskData.status?.status);
+    const tags = taskData.tags || [];
+    const hasResizeTag = tags.some(tag => tag.name?.toLowerCase() === TAG_RESIZES.toLowerCase());
+    if (hasResizeTag && newStatus === "WORKING") newStatus = "RE-SIZES";
+    if (!newStatus) continue;
+
+    updateSheetRow(taskId, newStatus);
+    Logger.log("Procesado: " + taskId + " -> " + newStatus);
+  }
+}
+
+function updateSheetRow(taskId, newStatus) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  for (const tabName of SHEET_TABS) {
+    const sheet = ss.getSheetByName(tabName);
+    if (!sheet) continue;
+
+    const lastRow = sheet.getLastRow();
+    if (lastRow < 2) continue;
+
+    const richValues = sheet.getRange(2, COL_LINK, lastRow - 1, 1).getRichTextValues();
+
+    for (let i = 0; i < richValues.length; i++) {
+      const url = extractUrl(richValues[i][0]);
+      if (!url) continue;
+
+      const cellTaskId = extractUrlTaskId(url);
+      if (cellTaskId !== taskId) continue;
+
+      const row        = i + 2;
+      const statusCell = sheet.getRange(row, COL_STATUS);
+      const currentStatus = statusCell.getValue();
+
+      if (currentStatus !== newStatus) {
+        statusCell.setValue(newStatus);
+        Logger.log("[" + tabName + "] Row " + row + ": " + currentStatus + " → " + newStatus);
+
+        if (newStatus === "SENT") {
+          const now = Utilities.formatDate(new Date(), TIMEZONE, "dd/MM/yyyy");
+          sheet.getRange(row, COL_DATE).setValue(now);
+          Logger.log("[" + tabName + "] SENT date → " + now);
+        }
+      }
+      return;
+    }
+  }
+  Logger.log("Tarea no encontrada en ninguna tab: " + taskId);
+}
+
+function getClickUpTaskSingle(taskId) {
+  try {
+    const response = UrlFetchApp.fetch(
+      "https://api.clickup.com/api/v2/task/" + taskId + "?include_subtasks=false",
+      {
+        method: "GET",
+        headers: { Authorization: CLICKUP_API_KEY },
+        muteHttpExceptions: true,
+      }
+    );
+    if (response.getResponseCode() !== 200) return null;
+    return JSON.parse(response.getContentText());
+  } catch (e) {
+    Logger.log("Error ClickUp API: " + e);
+    return null;
+  }
+}
+
+function borrarYReregistrar() {
+  // ⚠️ IMPORTANTE: Reemplaza esta URL con la tuya después de hacer Deploy
+  // Deploy → New Deployment → Web App → copiar URL /exec → pegar aquí
+  const urlCorrecta = "PEGAR_TU_URL_EXEC_AQUI";
+
+  const res = UrlFetchApp.fetch(
+    "https://api.clickup.com/api/v2/team/" + CLICKUP_TEAM_ID + "/webhook",
+    { headers: { Authorization: CLICKUP_API_KEY }, muteHttpExceptions: true }
+  );
+  const data = JSON.parse(res.getContentText());
+  Logger.log("Webhooks existentes: " + JSON.stringify(data.webhooks));
+
+  for (const wh of (data.webhooks || [])) {
+    UrlFetchApp.fetch("https://api.clickup.com/api/v2/webhook/" + wh.id, {
+      method: "DELETE",
+      headers: { Authorization: CLICKUP_API_KEY },
+      muteHttpExceptions: true,
+    });
+    Logger.log("Borrado: " + wh.id + " → " + wh.endpoint);
+  }
+
+  const response = UrlFetchApp.fetch(
+    "https://api.clickup.com/api/v2/team/" + CLICKUP_TEAM_ID + "/webhook",
+    {
+      method: "POST",
+      headers: { Authorization: CLICKUP_API_KEY, "Content-Type": "application/json" },
+      payload: JSON.stringify({
+        endpoint: urlCorrecta,
+        events: ["taskStatusUpdated", "taskTagUpdated"],
+        list_id: CLICKUP_LIST_ID,
+      }),
+      muteHttpExceptions: true,
+    }
+  );
+  Logger.log("Registro nuevo HTTP: " + response.getResponseCode());
+  Logger.log("Registro nuevo RAW: " + response.getContentText());
+}
+
+
+// ------------------------------------------------------------
+// POLLING — backup every 5 minutes
 // ------------------------------------------------------------
 function registrarTrigger() {
   const triggers = ScriptApp.getProjectTriggers();
@@ -39,20 +194,11 @@ function registrarTrigger() {
     .timeBased()
     .everyMinutes(5)
     .create();
-  Logger.log("✅ Trigger registered — syncStatuses every 5 minutes.");
+  Logger.log("✅ Trigger registrado — syncStatuses cada 5 minutos.");
 }
 
-
-// ------------------------------------------------------------
-// MAIN SYNC — runs every 5 minutes automatically
-// 1. Reads all task IDs from client tabs in the spreadsheet
-// 2. Fetches all task statuses from CU in bulk (pages of 100)
-// 3. Updates only the rows where status has changed
-// ------------------------------------------------------------
 function syncStatuses() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
-
-  // Step 1: Collect all task IDs from client tabs
   const taskMap = {};
 
   for (const tabName of SHEET_TABS) {
@@ -66,9 +212,9 @@ function syncStatuses() {
     const statusValues = sheet.getRange(2, COL_STATUS, lastRow - 1, 1).getValues();
 
     for (let i = 0; i < richValues.length; i++) {
-      const url = extractUrlFromCell(richValues[i][0]);
+      const url = extractUrl(richValues[i][0]);
       if (!url) continue;
-      const taskId = extractTaskIdFromUrl(url);
+      const taskId = extractUrlTaskId(url);
       if (!taskId) continue;
       taskMap[taskId] = { tabName, row: i + 2, currentStatus: statusValues[i][0] || "" };
     }
@@ -78,12 +224,10 @@ function syncStatuses() {
   if (totalTasks === 0) { Logger.log("No tasks found in any tab."); return; }
   Logger.log("Tasks found in spreadsheet: " + totalTasks);
 
-  // Step 2: Fetch all task statuses from CU in bulk
   const cuStatusMap = fetchAllTaskStatuses();
   if (!cuStatusMap) { Logger.log("ERROR: Could not fetch tasks from ClickUp."); return; }
   Logger.log("Tasks fetched from ClickUp: " + Object.keys(cuStatusMap).length);
 
-  // Step 3: Compare and update
   let updatedCount = 0;
 
   for (const [taskId, sheetData] of Object.entries(taskMap)) {
@@ -116,15 +260,10 @@ function syncStatuses() {
   Logger.log("Sync complete — updated: " + updatedCount + " / " + totalTasks + " tasks checked.");
 }
 
-
-// ------------------------------------------------------------
-// FETCH ALL TASK STATUSES FROM CU IN PAGES OF 100
-// Returns map: { taskId -> { status, tags } }
-// ------------------------------------------------------------
 function fetchAllTaskStatuses() {
   const cuMap = {};
   let page = 0;
-  const maxPages = 500; // high enough to never hit in practice
+  const maxPages = 500;
 
   while (page < maxPages) {
     const url = "https://api.clickup.com/api/v2/list/" + CLICKUP_LIST_ID +
@@ -162,11 +301,17 @@ function fetchAllTaskStatuses() {
   return cuMap;
 }
 
+function jsonResponse(obj) {
+  return ContentService
+    .createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
 
 // ------------------------------------------------------------
 // HELPERS — Part 1
 // ------------------------------------------------------------
-function extractUrlFromCell(richTextCell) {
+function extractUrl(richTextCell) {
   try {
     const runs = richTextCell.getRuns();
     for (const run of runs) {
@@ -179,7 +324,7 @@ function extractUrlFromCell(richTextCell) {
   return null;
 }
 
-function extractTaskIdFromUrl(url) {
+function extractUrlTaskId(url) {
   try {
     const cleanUrl = url.split("?")[0];
     const longMatch = cleanUrl.match(/clickup\.com\/t\/\d+\/([a-zA-Z0-9]+)/);
@@ -223,9 +368,6 @@ const COLS_PER_VERSION   = 3;
 const DUE_DATE_OFFSET    = 1;
 const STATUS_OFFSET      = 2;
 
-// ------------------------------------------------------------
-// MENU
-// ------------------------------------------------------------
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('VIP Sync')
@@ -235,9 +377,6 @@ function onOpen() {
     .addToUi();
 }
 
-// ------------------------------------------------------------
-// SET / GET API TOKEN
-// ------------------------------------------------------------
 function setApiToken() {
   const ui = SpreadsheetApp.getUi();
   const result = ui.prompt(
@@ -267,27 +406,18 @@ function getApiToken() {
   return token;
 }
 
-// ------------------------------------------------------------
-// EXTRACT TASK ID FROM CLICKUP URL
-// ------------------------------------------------------------
 function extractTaskId(url) {
   if (!url) return null;
   const match = url.match(/clickup\.com\/t\/([a-zA-Z0-9]+)/);
   return match ? match[1] : null;
 }
 
-// ------------------------------------------------------------
-// FORMAT TIMESTAMP → "July 7" style
-// ------------------------------------------------------------
 function formatDueDate(timestampMs) {
   if (!timestampMs) return '';
   const date = new Date(parseInt(timestampMs));
   return Utilities.formatDate(date, 'UTC', 'MMMM d');
 }
 
-// ------------------------------------------------------------
-// FETCH MAIN TASK + SUBTASKS FROM CLICKUP API
-// ------------------------------------------------------------
 function getTaskData(taskId, token) {
   const url = `https://api.clickup.com/api/v2/task/${taskId}?include_subtasks=true&subtasks=true`;
   const options = {
@@ -310,9 +440,6 @@ function getTaskData(taskId, token) {
   return null;
 }
 
-// ------------------------------------------------------------
-// PARSE VERSION LABEL FROM SUBTASK NAME
-// ------------------------------------------------------------
 function parseVersionLabel(name) {
   if (!name) return null;
   const vMatch = name.match(/_V(\d+)/i);
@@ -324,9 +451,6 @@ function parseVersionLabel(name) {
   return null;
 }
 
-// ------------------------------------------------------------
-// NORMALIZE LABEL for lookup
-// ------------------------------------------------------------
 function normalizeCellLabel(cellText) {
   if (!cellText) return null;
   const text = String(cellText).trim();
@@ -341,17 +465,11 @@ function normalizeCellLabel(cellText) {
   return null;
 }
 
-// ------------------------------------------------------------
-// NORMALIZE STATUS
-// ------------------------------------------------------------
 function normalizeStatus(statusName) {
   if (!statusName) return '';
   return statusName.toUpperCase();
 }
 
-// ------------------------------------------------------------
-// MAIN VIP SYNC FUNCTION
-// ------------------------------------------------------------
 function syncClickUp() {
   const token = getApiToken();
   if (!token) return;
@@ -398,9 +516,10 @@ function syncClickUp() {
 
     for (const subtask of subtasks) {
       const label = parseVersionLabel(subtask.name);
-      if (!label) continue;
+      if (!label) { Logger.log(`Row ${row}: Could not parse label from subtask name: "${subtask.name}"`); continue; }
       if (subtask.due_date) dueDateMap[label] = formatDueDate(subtask.due_date);
       if (subtask.status?.status) statusMap[label] = normalizeStatus(subtask.status.status);
+      Logger.log(`Row ${row}: CU subtask parsed → label="${label}", due="${dueDateMap[label] || ''}", status="${statusMap[label] || ''}"`);
     }
 
     const lastCol = sheet.getLastColumn();
@@ -414,18 +533,25 @@ function syncClickUp() {
       if (!versionText) { col += COLS_PER_VERSION; continue; }
 
       const cellLabel = normalizeCellLabel(versionText);
-      if (!cellLabel) { col += COLS_PER_VERSION; continue; }
+      if (!cellLabel) { Logger.log(`Row ${row}: Could not normalize cell label from: "${versionText}"`); col += COLS_PER_VERSION; continue; }
 
       coveredLabels.add(cellLabel);
+      Logger.log(`Row ${row}: Sheet col ${col} label="${cellLabel}" | CU dueDateMap has: ${JSON.stringify(dueDateMap)}`);
 
       if (dueDateMap[cellLabel] !== undefined) {
         sheet.getRange(row, col + DUE_DATE_OFFSET).setValue(dueDateMap[cellLabel]);
         updated = true;
+        Logger.log(`Row ${row}: ✅ Updated ${cellLabel} due date → ${dueDateMap[cellLabel]}`);
+      } else {
+        Logger.log(`Row ${row}: ⚠️ No due date in CU for label "${cellLabel}"`);
       }
+
       if (statusMap[cellLabel] !== undefined) {
         sheet.getRange(row, col + STATUS_OFFSET).setValue(statusMap[cellLabel]);
         updated = true;
+        Logger.log(`Row ${row}: ✅ Updated ${cellLabel} status → ${statusMap[cellLabel]}`);
       }
+
       col += COLS_PER_VERSION;
     }
 
@@ -444,6 +570,7 @@ function syncClickUp() {
       if (dueDateMap[label]) sheet.getRange(row, writeCol + DUE_DATE_OFFSET).setValue(dueDateMap[label]);
       if (statusMap[label])  sheet.getRange(row, writeCol + STATUS_OFFSET).setValue(statusMap[label]);
       updated = true;
+      Logger.log(`Row ${row}: ➕ Appended extra subtask "${label}" at col ${writeCol}`);
     }
 
     if (updated) updatedRows++;
@@ -452,9 +579,71 @@ function syncClickUp() {
 
   let message = `✅ Sync complete!\n\nRows updated: ${updatedRows}\n`;
   if (skippedRows.length > 0) {
-    message += `\n⚠️ Skipped ${skippedRows.length} row(s) due to connection errors: rows ${skippedRows.join(', ')}\nRun sync again to retry.`;
+    message += `\n⚠️ Skipped ${skippedRows.length} row(s) due to connection errors: rows ${skippedRows.join(', ')}\nRun sync again to retry those rows.`;
   }
   ui.alert(message);
+}
+
+function debugAllTasks() {
+  const token = getApiToken();
+  if (!token) return;
+
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('VIP');
+  if (!sheet) { Logger.log('Sheet VIP not found'); return; }
+
+  const lastRow = sheet.getLastRow();
+
+  for (let row = 163; row <= Math.min(163 + 10, lastRow); row++) {
+    const cell = sheet.getRange(row, COLUMN_CU_LINK);
+    const richText = cell.getRichTextValue();
+    let cuUrl = null;
+
+    if (richText) {
+      for (const run of richText.getRuns()) {
+        const link = run.getLinkUrl();
+        if (link && link.includes('clickup.com')) { cuUrl = link; break; }
+      }
+    }
+    if (!cuUrl) {
+      const val = cell.getValue();
+      if (val && String(val).includes('clickup.com')) cuUrl = String(val);
+    }
+    if (!cuUrl) continue;
+
+    const taskId = extractTaskId(cuUrl);
+    if (!taskId) continue;
+
+    Logger.log(`\n========== ROW ${row} | Task ID: ${taskId} ==========`);
+
+    const taskData = getTaskData(taskId, token);
+    if (!taskData) { Logger.log(`  ERROR: Could not fetch task`); continue; }
+
+    Logger.log(`  Main task: ${taskData.name}`);
+    Logger.log(`  Subtasks from CU API (${taskData.subtasks?.length || 0} total):`);
+
+    (taskData.subtasks || []).forEach((s, i) => {
+      const rawTs = s.due_date;
+      const formatted = rawTs ? Utilities.formatDate(new Date(parseInt(rawTs)), 'America/New_York', 'MMMM d') : 'NO DATE';
+      const label = parseVersionLabel(s.name);
+      Logger.log(`    [${i+1}] name="${s.name}" | label parsed="${label}" | raw_ts=${rawTs} | formatted="${formatted}" | status="${s.status?.status}"`);
+    });
+
+    Logger.log(`  Sheet current values (cols I onwards):`);
+    let col = VERSION_COL_START;
+    while (col <= sheet.getLastColumn()) {
+      const vCell = sheet.getRange(row, col).getValue();
+      const dCell = sheet.getRange(row, col + 1).getValue();
+      const sCell = sheet.getRange(row, col + 2).getValue();
+      if (!String(vCell).trim()) { col += COLS_PER_VERSION; continue; }
+      Logger.log(`    col ${col}: version="${vCell}" | date="${dCell}" | status="${sCell}"`);
+      col += COLS_PER_VERSION;
+    }
+
+    Utilities.sleep(300);
+  }
+
+  Logger.log('\n========== DEBUG COMPLETE ==========');
+  SpreadsheetApp.getUi().alert('Debug complete! Check View → Logs for details.');
 }
 
 
@@ -565,7 +754,7 @@ function generateVIPReport() {
   }
 
   if (projects.length === 0) {
-    SpreadsheetApp.getUi().alert('⚠️ No active projects found.');
+    SpreadsheetApp.getUi().alert('⚠️ No active projects found (SUBMITTED, WORKING, or QC APPROVED).');
     return;
   }
 
