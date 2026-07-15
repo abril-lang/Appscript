@@ -2,7 +2,7 @@
 //  CONFIGURACIÓN — Edita solo esta sección
 // ============================================================
 
-const CLICKUP_API_KEY = "TU_API_KEY_AQUI";  // ← Tu API Key de ClickUp
+const CLICKUP_API_KEY = "pk_48471313_83LBGLH3O5CDH1LTN40F8G47NVCQNKN2";  // ← Tu API Key de ClickUp
 const CLICKUP_LIST_ID = "88301430";
 const CLICKUP_TEAM_ID = "10628585";
 
